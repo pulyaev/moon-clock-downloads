@@ -1,0 +1,77 @@
+name: Stage desktop release
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing draft version
+        required: true
+        type: string
+      assets:
+        description: Verified package metadata and temporary download URLs
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Copy verified binaries into the existing draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_ASSETS: ${{ inputs.assets }}
+        shell: python
+        run: |
+          import base64, hashlib, json, os, re, sys, tempfile, urllib.request, urllib.parse
+          from pathlib import Path
+          repo = 'pulyaev/moon-clock-downloads'
+          version = os.environ['RELEASE_VERSION']
+          assert re.fullmatch(r'\d+\.\d+\.\d+', version)
+          assets = json.loads(os.environ['RELEASE_ASSETS'])
+          expected = {f'MoonClock-Preview-{version}-macOS-{arch}.{ext}' for arch in ('arm64','x86_64') for ext in ('zip','dmg')}
+          expected |= {f'MoonClock-Preview-{version}.0-{arch}{suffix}' for arch in ('arm64','x64') for suffix in ('-portable.zip','.msix')}
+          expected |= {f'MoonClock-Preview-{version}.0.msixbundle', f'MoonClock-Preview-{version}.0-Windows10-x64.msix', 'build-info-windows.json', 'build-info-macos-arm64.json', 'build-info-macos-x86_64.json', 'SHA256.txt'}
+          assert len(assets)==14 and {a['name'] for a in assets}==expected
+          def api(path, method='GET', data=None):
+              req=urllib.request.Request('https://api.github.com/repos/'+repo+path, data=data, method=method, headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json'})
+              with urllib.request.urlopen(req,timeout=60) as response:
+                  body=response.read()
+                  return json.loads(body) if body else None
+          try:
+              release=next(r for r in api('/releases?per_page=100') if r['tag_name']=='v'+version)
+              assert release['draft'], 'Published files are immutable'
+              existing={a['name']:a for a in api('/releases/'+str(release['id'])+'/assets?per_page=100')}
+              with tempfile.TemporaryDirectory() as folder:
+                  for item in assets:
+                      name=item['name']; digest=item['sha256']; size=item['size']
+                      assert re.fullmatch(r'[a-f0-9]{64}',digest) and 0<size<250*1024*1024
+                      old=existing.get(name)
+                      if old and old['state']=='uploaded':
+                          assert old['digest']=='sha256:'+digest and old['size']==size
+                          print('Verified existing',name,flush=True); continue
+                      if old:
+                          assert old['state']=='starter'
+                          api('/releases/assets/'+str(old['id']),'DELETE')
+                      path=Path(folder)/name
+                      if name=='SHA256.txt':
+                          path.write_bytes(base64.b64decode(item['content'],validate=True))
+                      else:
+                          url=item['url']; parsed=urllib.parse.urlparse(url)
+                          assert parsed.scheme=='https' and parsed.hostname=='release-assets.githubusercontent.com'
+                          print('::add-mask::'+url)
+                          with urllib.request.urlopen(url,timeout=90) as response,path.open('wb') as target:
+                              total=0
+                              while block:=response.read(1024*1024):
+                                  total+=len(block); assert total<=size; target.write(block)
+                      assert path.stat().st_size==size and hashlib.sha256(path.read_bytes()).hexdigest()==digest
+                      url='https://uploads.github.com/repos/'+repo+'/releases/'+str(release['id'])+'/assets?name='+urllib.parse.quote(name)
+                      req=urllib.request.Request(url,data=path.read_bytes(),method='POST',headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','Content-Type':'application/octet-stream'})
+                      with urllib.request.urlopen(req,timeout=180) as response: result=json.load(response)
+                      assert result['state']=='uploaded' and result['digest']=='sha256:'+digest and result['size']==size
+                      path.unlink(); print('Uploaded and verified',name,flush=True)
+              print('All 14 draft assets verified; publication is a separate action.',flush=True)
+          except Exception as error:
+              print('Asset transfer failed:',type(error).__name__,flush=True)
+              sys.exit(1)
